@@ -170,3 +170,4 @@ data/
 
 # Ignore test file
 test.py
+archive.py
