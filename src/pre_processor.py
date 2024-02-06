@@ -2,6 +2,7 @@ import polars as pl
 from rapidfuzz import process, fuzz
 import warnings
 import re
+import util as u
 
 class Processor:
     def __init__(self) -> None:
@@ -64,16 +65,26 @@ class Formatter:
         df = self._format_SNP(df)
         # Format the phenotype column
         df = self._format_phenotype(df)
-        # for every unique data_type, remove duplicated SNPS
+        # Remove duplicated SNPS for every unique data_type
         df = df.groupby(self.config['data_type']).apply(self._remove_duplicates)
-        # check if MR columns are presented
+        # Check if MR columns are presented
         df = self._check_mr_columns(df)
+        # Format all columns
         df = self._format_beta(df)
         df = self._format_se(df)
         df = self._format_eaf(df)
         df = self._format_effect_allele(df)
         df = self._format_other_allele(df)
-
+        df = self._check_and_infer_pval(df)
+        df = self._format_ncase(df)
+        df = self._format_ncontrol(df)
+        df = self._format_samplesize(df)
+        df = self._format_other_cols(df)
+        df = self._format_units_col(df)
+        # Create fake id
+        df = self._create_id_col(df)
+        # Handles the mr_keep logic
+        df = self._keep_mr_col(df)
         return df
 
     def _initial_check(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -289,13 +300,54 @@ class Formatter:
         return df
     
     def _format_units_col(self, df: pl.DataFrame) -> pl.DataFrame:
+        # Formats the units column by casting it to string and appending it to the phenotype column if
+        # multiple unique units are detected for the same phenotype.
         units_col = self.config['units_col']
+        phenotype_col = self.config['data_type']  # Assuming 'data_type' holds the column name for phenotype
+        
         if units_col in df.columns:
             df = df.with_column(pl.col(units_col).cast(pl.Utf8).alias("units.outcome"))
-            # Additional logic for appending units to phenotype type could be implemented here,
-            # depending on the specifics of the check_units function and the phenotype column handling. # TODO: add check_unit function here
+            temp = self._check_units(df, phenotype_col, "units.outcome")
+            
+            # If any group has more than one type of unit, append units to the phenotype column
+            if any(temp['ph']):
+                # This operation assumes that the phenotype column is already present in the DataFrame
+                # Create a new column that conditionally appends units if 'ph' is True
+                df = df.join(temp, on=phenotype_col, how="left")
+                df = df.with_column(
+                    pl.when(pl.col("ph"))
+                    .then(pl.col(phenotype_col) + " (" + pl.col("units.outcome") + ")")
+                    .otherwise(pl.col(phenotype_col))
+                    .alias(phenotype_col + "_with_units")
+                )
+                # Optionally, replace the original phenotype column with the new one
+                df = df.drop(phenotype_col).rename({phenotype_col + "_with_units": phenotype_col})
+                
         return df
     
+    def _check_units(self, df: pl.DataFrame, id_col: str, unit_col: str) -> pl.DataFrame:
+        """
+        Checks for each group defined by `id_col` in the dataframe if there are multiple unique units
+        specified in `unit_col`. Generates a warning for groups with more than one type of unit.
+        """
+        # Group by `id_col` and aggregate to check for unique units within each group
+        temp = df.groupby(id_col).agg([
+            (pl.col(unit_col).n_unique().alias("unique_units")),
+            (pl.first(unit_col).alias("first_unit"))
+        ])
+        # Identify groups with more than one unique unit
+        temp = temp.with_column(
+            (pl.col("unique_units") > 1).alias("ph")
+        )
+        # Warning for groups with more than one type of unit
+        warnings = temp.filter(pl.col("ph")).select([id_col, "first_unit"])
+        for row in warnings.to_dicts():
+            print(f"Warning: More than one type of unit specified for {row[id_col]}")
+        # Drop unnecessary columns for the final output, only return 'ph' flag
+        temp = temp.select([id_col, "ph"])
+        return temp
+
+
     def _create_id_col(self, df: pl.DataFrame) -> pl.DataFrame:
         # Creates or formats the ID column. If the ID column exists, it is converted to string.
         # If it does not exist, generates new IDs based on some criteria (not detailed here).
@@ -303,8 +355,7 @@ class Formatter:
         if id_col in df.columns:
             df = df.with_column(pl.col(id_col).cast(pl.Utf8).alias("id.outcome"))
         else:
-            # Assuming create_ids is a function to generate IDs, which needs to be implemented
-            df = df.with_column(self.create_ids(df[self.config['data_type']]).alias("id.outcome")) # TODO: add crete_ids function here
+            df = df.with_column(u.create_ids(df[self.config['data_type']]).alias("id.outcome"))
         return df
     
     def _keep_mr_col(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -323,6 +374,5 @@ class Formatter:
         for col in mr_cols:
             if col not in df.columns:
                 df = df.with_column(pl.lit(None).alias(col))
-
         return df
     
