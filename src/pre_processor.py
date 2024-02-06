@@ -1,8 +1,9 @@
 import polars as pl
 from rapidfuzz import process, fuzz
 import warnings
+from collections import defaultdict
 import re
-import util as u
+import src.util as u
 
 class Processor:
     def __init__(self) -> None:
@@ -10,6 +11,131 @@ class Processor:
 
     def format_data(self, df: pl.DataFrame) -> pl.DataFrame:
         pass
+
+
+class Renamer:
+    def __init__(self, sample=True, rename_mapping=None) -> None:
+        self.COLS_TO_KEEP = ['chr', 'pos', 'SNP', 'effect_allele', 'other_allele', 'eaf', 'beta', 'se', 'pval'] # not an variable to be changed
+        self.sample = sample
+        self.rename_mapping = rename_mapping
+        self.existing_col = []
+        self.reverse_mapping = defaultdict(list)
+
+    def reset_status(self, dropped_df=None):
+        # reset the status of rename_mapping and existing_col
+        print(f'columns {self.existing_col} dropped')
+        if dropped_df:
+            print('top 10 rows of the dropped columns:')
+            print(dropped_df) # TODO change to logger
+        self.existing_col = [] # reset status for Renamer instances
+        self.reverse_mapping = None # reset reverse_mapping dict
+
+
+    def rename(self, df: pl.DataFrame, allele_cols=None) -> pl.DataFrame:
+        if self.rename_mapping:
+            detected_mapping = self.rename_mapping
+        else:
+            print('No rename_mapping provided, generating rename_mapping automatically') # TODO change to logger
+            detected_mapping = {}
+            
+            if allele_cols:
+                detected_mapping[allele_cols[0]] = 'effect_allele'
+                detected_mapping[allele_cols[1]] = 'other_allele'
+            else:
+                warnings('Allele columns are not provided! Infering automatically')
+                if self.sample:
+                    effect_allele_col, other_allele_col = self._detect_allele_col(df.sample(1000))
+                else:
+                    effect_allele_col, other_allele_col = self._detect_allele_col(df)
+                detected_mapping[effect_allele_col] = 'effect_allele'
+                detected_mapping[other_allele_col] = 'other_allele'
+
+            
+            self.existing_col = [x for x in df.columns if x not in [effect_allele_col, other_allele_col]]
+            rename_to_num_mapping = {old_name.lower(): str(new_name) for old_name, new_name in zip(df.columns, range(1, len(df.columns) + 1))}
+            self.reverse_mapping = u.reverse_dict(rename_to_num_mapping) # Note: this is a defaultdict(list)
+            df = df.rename(rename_to_num_mapping)
+
+            if self.sample:
+                detected_mapping.update(self._get_rename_mapping(df.sample(1000)))
+            else:
+                detected_mapping.update(self._get_rename_mapping(df))
+        
+        df = df.rename(detected_mapping)
+        dropped_df = df.select([x for x in self.existing_col if x not in self.COLS_TO_KEEP]).head(10)
+        df = df.select(self.COLS_TO_KEEP)        
+        self.reset_status(dropped_df)
+        return df
+    
+    def _detect_allele_col(self, df: pl.DataFrame) -> str:
+        # find the two colnames that contains CGTADI
+        allele_columns = []
+        pattern = re.compile(r'^[ACTGDI]+$')
+        for name in df.columns:
+            # Check if column is of type string
+            if df[name].dtype == pl.Utf8:
+                # Exclude both None and empty strings before applying the pattern match
+                valid_values = [val for val in df[name].to_list() if val and val.strip() != '']
+                if all(pattern.match(val) for val in valid_values):
+                    allele_columns.append(name)
+        if len(allele_columns) > 2:
+            raise ValueError(f'More than 2 allele columns detected, detected columns are: {allele_columns}')
+        
+        if len(allele_columns) == 0:
+            raise ValueError('No allele column detected')
+        
+        if len(allele_columns) == 1:
+            raise ValueError(f'Only 1 allele column detected, detected column is: {allele_columns[0]}')
+        
+        # determin if the column is phrased as effect/other or reference/alternative using fuzzy matching
+        ref_best_match, ref_best_score, _ = process.extractOne('ref', allele_columns, scorer=fuzz.ratio)
+        alt_best_match, alt_best_score, _ = process.extractOne('alt', allele_columns, scorer=fuzz.ratio)
+        effect_best_match, effect_best_score, _ = process.extractOne('effect', allele_columns, scorer=fuzz.ratio)
+        other_best_match, other_best_score, _ = process.extractOne('other', allele_columns, scorer=fuzz.ratio)
+
+        ref_alt_score = ref_best_score + alt_best_score
+        effect_other_score = effect_best_score + other_best_score
+
+        if effect_other_score >= ref_alt_score:
+            return effect_best_match, other_best_match # consider effect_allele to be effect_allele
+        else:
+            return alt_best_score, alt_best_match # consider alternative_allele to be effect_allele
+
+    def _get_rename_mapping(self, df: pl.DataFrame) -> dict:
+        self._remove_na_col(df) # remove columns with more than 30% of NA in self.existing_col
+        # renmame SNP column
+        detected_mapping = {}
+        detected_mapping[self._identify_SNP_col(df)] = 'SNP'
+        # detected_mapping[self._identify_chr_col(df)] = 'chr'
+        # detected_mapping[self._identify_pos_col(df)] = 'pos'
+
+        # detected_mapping[self._identify_beta_col(df)] = 'beta'
+
+        # detected_mapping[self._identify_eaf_col(df)] = 'eaf'
+        # detected_mapping[self._identify_se_col(df)] = 'se'
+        # detected_mapping[self._identify_pval_col(df)] = 'pval'
+        return detected_mapping
+
+    def _remove_na_col(self, df: pl.DataFrame, threshold=0.3) -> None:
+        # update self.existing_col to exclude columns with porportion of NA more than threshold
+        proportion_missing = [u.get_col_missing_condition(df[col]).mean() for col in df.columns]
+        lower_than_threshold = [x < threshold for x in proportion_missing]
+        self.existing_col = [col for col, include in zip(self.existing_col, lower_than_threshold) if include]
+
+
+    def _identify_SNP_col(self, df: pl.DataFrame, threshold=0.7) -> str:
+        # return the most likely col name for the SNP column
+        # need to have more than threshold percent rows begins with 'rs'
+        existing_col = [x.lower() for x in self.existing_col]
+        for col in df.columns:
+            if df.filter(pl.col(col).str.contains("^rs")).height > threshold*len(df):
+                return self.reverse_mapping[col][0]
+        else:
+            raise ValueError('SNP column not found, please provide ')
+        
+
+
+
 
 
 class Formatter:

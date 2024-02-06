@@ -1,6 +1,7 @@
 import random
 import string
 import polars as pl
+from collections import defaultdict # TODO change all dict to defaultdict
 
 def random_string(n=1, len=6):
     """
@@ -32,3 +33,18 @@ def create_ids(series: pl.Series) -> pl.Series:
     mapping = {value: id for value, id in zip(unique_values, random_ids)}
     return series.apply(lambda x: mapping[x])
 
+
+def get_col_missing_condition(col: pl.Series):
+    # getting the condition for judging if rows are NA
+    if col.dtype == pl.Utf8:
+        condition = col.is_null() | (col == '')
+    else:
+        condition = col.is_null()
+    return condition
+
+def reverse_dict(original_dict:dict) -> dict:
+    # reverse key/value pair for a dictionary
+    reversed_dict = defaultdict(list)
+    for key, value in original_dict.items():
+        reversed_dict[value].append(key)
+    return reversed_dict
