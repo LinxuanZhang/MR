@@ -44,6 +44,7 @@ def get_col_missing_condition(col: pl.Series):
 
 def reverse_dict(original_dict:dict) -> dict:
     # reverse key/value pair for a dictionary
+    # can't use list comprehension as the value may be of multiple values
     reversed_dict = defaultdict(list)
     for key, value in original_dict.items():
         reversed_dict[value].append(key)

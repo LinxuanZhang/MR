@@ -171,3 +171,10 @@ data/
 # Ignore test file
 test.py
 archive.py
+beta_function.py
+
+# Ignore all the config files
+config/*
+
+# Un-ignore the template config files
+!config/data_cleaning_template.yml

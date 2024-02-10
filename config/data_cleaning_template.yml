@@ -1,0 +1,17 @@
+rename_mapping:
+  chr_col: chromosome
+  pos_col: base_pair_location
+  SNP_col: variant_id
+  effect_allele_col: effect_allele
+  other_allele_col: other_allele
+  # eaf_col: null # Can be None
+  # eaf_col: null # Can be a string
+  eaf_col:  # Can be a list
+    - eaf_column_name1
+    - eaf_column_name2
+  beta_col: beta
+  se_col: standard_error
+  pval_col: p_value
+
+input_file: GCST90029070_buildGRCh37.tsv
+output_file: CRP.csv
