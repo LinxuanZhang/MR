@@ -178,3 +178,6 @@ config/*
 
 # Un-ignore the template config files
 !config/data_cleaning_template.yml
+
+# Ignore plink file (for now)
+plink/*

@@ -31,7 +31,7 @@ def create_ids(series: pl.Series) -> pl.Series:
     unique_values = series.unique().to_list()
     random_ids = random_string(n=len(unique_values), len=6)
     mapping = {value: id for value, id in zip(unique_values, random_ids)}
-    return series.apply(lambda x: mapping[x])
+    return series.replace(mapping)
 
 
 def get_col_missing_condition(col: pl.Series):

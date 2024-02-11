@@ -1,10 +1,8 @@
 import polars as pl
-from rapidfuzz import process, fuzz
 import warnings
-from collections import defaultdict
 import re
-import src.util as u
-from scipy.stats import skew
+import src.util_preprocess as u
+
 
 class Processor:
     def __init__(self) -> None:
@@ -55,7 +53,6 @@ class Renamer:
         df = df.select(columns_to_keep)
         
         return df
-
 
 
 class Formatter:
@@ -112,7 +109,7 @@ class Formatter:
         # Format the phenotype column
         df = self._format_phenotype(df)
         # Remove duplicated SNPS for every unique data_type
-        df = df.groupby(self.config['data_type']).apply(self._remove_duplicates)
+        df = df.group_by(self.config['data_type']).map_groups(self._remove_duplicates)
         # Check if MR columns are presented
         df = self._check_mr_columns(df)
         # Format all columns
@@ -177,7 +174,7 @@ class Formatter:
 
         return df
     
-    def _remove_duplicates(self, group_df: pl.DataFrame) -> pl.DataFrame:
+    def _remove_duplicates(self, group_df: pl.DataFrame, verbose=False) -> pl.DataFrame:
         # Identify duplicate SNPs within the group
         dup_mask = group_df['SNP'].is_duplicated().alias("dup")
         # Add a duplicate mask column to the DataFrame
@@ -185,7 +182,8 @@ class Formatter:
         # Check if there are any duplicates and print a warning if so
         if group_df_with_dup.filter(pl.col("dup")).height > 0:
             duplicated_snps = group_df_with_dup.filter(pl.col("dup"))['SNP'].to_list()
-            print(f"Duplicated SNPs present in exposure data for phenotype '{group_df_with_dup[type][0]}'. Just keeping the first instance:\n" + "\n".join(duplicated_snps))
+            if verbose:
+                print(f"Duplicated SNPs present in exposure data for phenotype '{group_df_with_dup[self.config['data_type']][0]}'. Just keeping the first instance:\n" + "\n".join(duplicated_snps))
         
         # Filter out duplicates
         return group_df_with_dup.filter(~pl.col("dup")).drop("dup")
@@ -216,8 +214,13 @@ class Formatter:
         # Format the beta column
         if self.config['beta_col'] in df.columns:
             df = df.rename({self.config['beta_col']: 'beta.outcome'})
-            df = df.with_columns(pl.col('beta.outcome').cast(pl.Float64).fill_none(pl.lit(None)))
-            df = df.with_columns(pl.when(pl.col('beta.outcome').is_not_finite()).then(None).otherwise(pl.col('beta.outcome')).alias('beta.outcome'))
+            df = df.with_columns(pl.col('beta.outcome').cast(pl.Float64).fill_nan(pl.lit(None)))
+            df = df.with_columns(
+                pl.when(pl.col('beta.outcome').is_finite().not_())
+                .then(None)
+                .otherwise(pl.col('beta.outcome'))
+                .alias('beta.outcome')
+            )
         else:
             warnings.warn("beta column is not present.")
         return df
@@ -226,8 +229,16 @@ class Formatter:
         # Format the se column
         if self.config['se_col'] in df.columns:
             df = df.rename({self.config['se_col']: 'se.outcome'})
-            df = df.with_columns(pl.col('se.outcome').cast(pl.Float64).fill_none(pl.lit(None)))
-            df = df.with_columns(pl.when((pl.col('se.outcome').is_not_finite()) | (pl.col('se.outcome') <= 0)).then(None).otherwise(pl.col('se.outcome')).alias('se.outcome'))
+            df = df.with_columns(pl.col('se.outcome').cast(pl.Float64).fill_nan(pl.lit(None)))
+            df = df.with_columns(
+                pl.when(
+                    pl.col('se.outcome').is_finite().not_() | 
+                    (pl.col('se.outcome') <= 0)
+                )
+                .then(None)
+                .otherwise(pl.col('se.outcome'))
+                .alias('se.outcome')
+            )
         else:
             warnings.warn("se column is not present.")
         return df
@@ -236,8 +247,16 @@ class Formatter:
         # Format the eaf column
         if self.config['eaf_col'] in df.columns:
             df = df.rename({self.config['eaf_col']: 'eaf.outcome'})
-            df = df.with_columns(pl.col('eaf.outcome').cast(pl.Float64).fill_none(pl.lit(None)))
-            df = df.with_columns(pl.when((pl.col('eaf.outcome').is_not_finite()) | (pl.col('eaf.outcome') <= 0) | (pl.col('eaf.outcome') >= 1)).then(None).otherwise(pl.col('eaf.outcome')).alias('eaf.outcome'))
+            df = df.with_columns(pl.col('eaf.outcome').cast(pl.Float64).fill_nan(pl.lit(None)))
+            df = df.with_columns(
+                pl.when(
+                    pl.col('eaf.outcome').is_finite().not_() | 
+                    (pl.col('eaf.outcome') <= 0) | 
+                    (pl.col('eaf.outcome') >= 1)
+                )
+                .then(None)
+                .otherwise(pl.col('eaf.outcome'))
+                .alias('eaf.outcome'))
         else:
             warnings.warn("eaf column is not present.")
         return df
@@ -246,7 +265,7 @@ class Formatter:
         # Format the effect allele column
         if self.config['effect_allele_col'] in df.columns:
             df = df.rename({self.config['effect_allele_col']: 'effect_allele.outcome'})
-            df = df.with_columns(pl.col('effect_allele.outcome').str.upper().apply(lambda value: None if (not re.match("^[ACTGDI]+$", value)) else value).alias('effect_allele.outcome')) # TODO: Check why D and I
+            df = df.with_columns(pl.col('effect_allele.outcome').str.to_uppercase().apply(lambda value: None if (not re.match("^[ACTGDI]+$", value)) else value).alias('effect_allele.outcome')) # TODO: Check why D and I
         else:
             warnings.warn("effect_allele column is not present.")
         return df
@@ -255,7 +274,7 @@ class Formatter:
         # Format the other allele column
         if self.config['other_allele_col'] in df.columns:
             df = df.rename({self.config['other_allele_col']: 'other_allele.outcome'})
-            df = df.with_columns(pl.col('other_allele.outcome').str.upper().apply(lambda value: None if (not re.match("^[ACTGDI]+$", value)) else value).alias('other_allele.outcome')) # TODO: CHeck why D and I
+            df = df.with_columns(pl.col('other_allele.outcome').str.to_uppercase().apply(lambda value: None if (not re.match("^[ACTGDI]+$", value)) else value).alias('other_allele.outcome')) # TODO: CHeck why D and I
         else:
             warnings.warn("other_allele column is not present.")
         return df
@@ -266,15 +285,19 @@ class Formatter:
         # Updates the DataFrame to include corrected or inferred p-value outcomes and their origin.
         pval_col = self.config['pval_col']
         if pval_col in df.columns:
-            df = df.with_column(pl.col(pval_col).cast(pl.Float64).alias("pval.outcome"))
+            df = df.with_columns(pl.col(pval_col).cast(pl.Float64).alias("pval.outcome"))
             # Coerce non-numeric pval to numeric and handle out-of-range values
-            df = df.with_column(
-                pl.when(pl.col("pval.outcome").is_not_finite() | (pl.col("pval.outcome") < 0) | (pl.col("pval.outcome") > 1))
+            df = df.with_columns(
+                pl.when(
+                    pl.col("pval.outcome").is_finite().not_() | 
+                    (pl.col("pval.outcome") < 0) | 
+                    (pl.col("pval.outcome") > 1)
+                )
                 .then(pl.lit(None))
                 .otherwise(pl.col("pval.outcome")).alias("pval.outcome")
             )
             # Replace values below min_pval with min_pval
-            df = df.with_column(
+            df = df.with_columns(
                 pl.when(pl.col("pval.outcome") < self.config['min_pval'])
                 .then(self.config['min_pval'])
                 .otherwise(pl.col("pval.outcome")).alias("pval.outcome")
@@ -284,13 +307,13 @@ class Formatter:
             beta_col = self.config['beta_col']
             se_col = self.config['se_col']
             if beta_col in df.columns and se_col in df.columns:
-                df = df.with_column(
+                df = df.with_columns(
                     pl.when(pl.col("pval.outcome").is_null())
                     .then(pl.expr.expr_to_polars(pl.lit(2) * pl.functions.p_norm(-abs(pl.col(beta_col)) / pl.col(se_col))))
                     .otherwise(pl.col("pval.outcome"))
                     .alias("pval.outcome")
                 )
-                df = df.with_column(
+                df = df.with_columns(
                     pl.when(pl.col("pval.outcome").is_null())
                     .then(pl.lit("inferred"))
                     .otherwise(pl.lit("reported"))
@@ -309,31 +332,35 @@ class Formatter:
         # Formats and validates the 'ncase' column, renaming it and ensuring it is numeric.
         ncase_col = self.config['ncase_col']
         if ncase_col in df.columns:
-            df = df.with_column(pl.col(ncase_col).cast(pl.Float64).alias("ncase.outcome"))
+            df = df.with_columns(pl.col(ncase_col).cast(pl.Float64).alias("ncase.outcome"))
         return df
 
     def _format_ncontrol(self, df: pl.DataFrame) -> pl.DataFrame:
         # Formats and validates the 'ncontrol' column, renaming it and ensuring it is numeric.
         ncontrol_col = self.config['ncontrol_col']
         if ncontrol_col in df.columns:
-            df = df.with_column(pl.col(ncontrol_col).cast(pl.Float64).alias("ncontrol.outcome"))
+            df = df.with_columns(pl.col(ncontrol_col).cast(pl.Float64).alias("ncontrol.outcome"))
         return df
 
     def _format_samplesize(self, df: pl.DataFrame) -> pl.DataFrame:
         # Formats the 'samplesize' column, validates it, and calculates it from 'ncase' and 'ncontrol' if necessary.
         samplesize_col = self.config['samplesize_col']
         if samplesize_col in df.columns:
-            df = df.with_column(pl.col(samplesize_col).cast(pl.Float64).alias("samplesize.outcome"))
+            df = df.with_columns(pl.col(samplesize_col).cast(pl.Float64).alias("samplesize.outcome"))
             # Calculate samplesize from ncase and ncontrol if samplesize is NA and both ncase and ncontrol are present
             if "ncase.outcome" in df.columns and "ncontrol.outcome" in df.columns:
-                df = df.with_column(
-                    pl.when(pl.col("samplesize.outcome").is_null() & pl.col("ncase.outcome").is_not_null() & pl.col("ncontrol.outcome").is_not_null())
+                df = df.with_columns(
+                    pl.when(
+                        pl.col("samplesize.outcome").is_null() & 
+                        (pl.col("ncase.outcome").is_not_null()) & 
+                        (pl.col("ncontrol.outcome").is_not_null())
+                    )
                     .then(pl.col("ncase.outcome") + pl.col("ncontrol.outcome"))
                     .otherwise(pl.col("samplesize.outcome"))
                     .alias("samplesize.outcome")
                 )
         elif "ncase.outcome" in df.columns and "ncontrol.outcome" in df.columns:
-            df = df.with_column((pl.col("ncase.outcome") + pl.col("ncontrol.outcome")).alias("samplesize.outcome"))
+            df = df.s((pl.col("ncase.outcome") + pl.col("ncontrol.outcome")).alias("samplesize.outcome"))
         return df
 
     def _format_other_cols(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -352,7 +379,7 @@ class Formatter:
         phenotype_col = self.config['data_type']  # Assuming 'data_type' holds the column name for phenotype
         
         if units_col in df.columns:
-            df = df.with_column(pl.col(units_col).cast(pl.Utf8).alias("units.outcome"))
+            df = df.with_columns(pl.col(units_col).cast(pl.Utf8).alias("units.outcome"))
             temp = self._check_units(df, phenotype_col, "units.outcome")
             
             # If any group has more than one type of unit, append units to the phenotype column
@@ -360,7 +387,7 @@ class Formatter:
                 # This operation assumes that the phenotype column is already present in the DataFrame
                 # Create a new column that conditionally appends units if 'ph' is True
                 df = df.join(temp, on=phenotype_col, how="left")
-                df = df.with_column(
+                df = df.with_columns(
                     pl.when(pl.col("ph"))
                     .then(pl.col(phenotype_col) + " (" + pl.col("units.outcome") + ")")
                     .otherwise(pl.col(phenotype_col))
@@ -382,7 +409,7 @@ class Formatter:
             (pl.first(unit_col).alias("first_unit"))
         ])
         # Identify groups with more than one unique unit
-        temp = temp.with_column(
+        temp = temp.with_columns(
             (pl.col("unique_units") > 1).alias("ph")
         )
         # Warning for groups with more than one type of unit
@@ -399,9 +426,9 @@ class Formatter:
         # If it does not exist, generates new IDs based on some criteria (not detailed here).
         id_col = self.config['id_col']
         if id_col in df.columns:
-            df = df.with_column(pl.col(id_col).cast(pl.Utf8).alias("id.outcome"))
+            df = df.with_columns(pl.col(id_col).cast(pl.Utf8).alias("id.outcome"))
         else:
-            df = df.with_column(u.create_ids(df[self.config['data_type']]).alias("id.outcome"))
+            df = df.with_columns(u.create_ids(df[self.config['data_type']]).alias("id.outcome"))
         return df
     
     def _keep_mr_col(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -409,9 +436,15 @@ class Formatter:
         # Also ensures that all necessary columns for MR analysis are present, adding them if they are missing.
         mr_cols = ["SNP", "beta.outcome", "se.outcome", "effect_allele.outcome", "other_allele.outcome", "eaf.outcome"]
         if "mr_keep.outcome" in df.columns:
+            # Ensure `mr_cols_present` contains columns that are actually in `df`
             mr_cols_present = [col for col in mr_cols if col in df.columns]
-            df = df.with_column(
-                pl.when(pl.all([df[col].is_not_null() for col in mr_cols_present]))
+
+            # Create a condition that checks if any of the columns in `mr_cols_present` are null
+            condition = df.select(mr_cols_present).fold(lambda s1, s2: s1.is_not_null() & s2.is_not_null())
+
+            # Use the condition to update "mr_keep.outcome"
+            df = df.with_columns(
+                pl.when(condition)
                 .then(df["mr_keep.outcome"])
                 .otherwise(pl.lit(False)).alias("mr_keep.outcome")
             )
@@ -419,6 +452,6 @@ class Formatter:
         # Ensuring all necessary MR columns are present
         for col in mr_cols:
             if col not in df.columns:
-                df = df.with_column(pl.lit(None).alias(col))
+                df = df.with_columns(pl.lit(None).alias(col))
         return df
     
