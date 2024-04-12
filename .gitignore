@@ -181,3 +181,6 @@ config/*
 
 # Ignore plink file (for now)
 plink/*
+
+# Ignore notes
+Note.md

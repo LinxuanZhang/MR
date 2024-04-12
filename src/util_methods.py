@@ -4,6 +4,7 @@ import os
 import subprocess
 import random
 import string
+import numpy as np
 
 def run_clumping(exposure_df, ancestry='EUR'):
     """
@@ -80,6 +81,7 @@ def run_clumping(exposure_df, ancestry='EUR'):
 
     return out
 
+
 def clumping_archive(exp):
     # Define parameters
     clump_kb = 10000
@@ -144,34 +146,4 @@ def clumping_archive(exp):
     return out
 
 
-def get_missing_beta_pval_se(df, known1, known2):
-    """
-    Calculate the missing value ('beta', 'pval', or 'se') in a dataframe given the other two.
-    
-    Parameters:
-    - df: Polars DataFrame containing the columns of interest.
-    - known1: The first known value type ('beta', 'pval', 'se').
-    - known2: The second known value type ('beta', 'pval', 'se').
-    
-    Returns:
-    - Updated Polars DataFrame with the calculated missing value.
-    """
-    if 'beta' in [known1, known2] and 'pval' in [known1, known2]:
-        # Calculate 'se' using 'beta' and 'pval'
-        df = df.with_column(
-            (pl.col('beta').abs() / norm.ppf(1 - pl.col('pval') / 2)).alias('se')
-        )
-    elif 'beta' in [known1, known2] and 'se' in [known1, known2]:
-        # TODO: finish this
-        # Calculate 'pval' from 'beta' and 'se' - Example approach, might not be directly feasible
-        # as it requires statistical assumptions and inverse operations.
-        pass  # Placeholder for potential implementation
-    elif 'pval' in [known1, known2] and 'se' in [known1, known2]:
-        # TODO: finish this
-        # Calculate 'beta' from 'pval' and 'se' - This also might not be directly feasible
-        # without more context or assumptions.
-        pass  # Placeholder for potential implementation
-    else:
-        raise ValueError("Invalid combination of known values. Must be a combination of 'beta', 'pval', and 'se'.")
 
-    return df

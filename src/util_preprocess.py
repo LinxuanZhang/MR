@@ -42,6 +42,7 @@ def get_col_missing_condition(col: pl.Series):
         condition = col.is_null()
     return condition
 
+
 def reverse_dict(original_dict:dict) -> dict:
     # reverse key/value pair for a dictionary
     # can't use list comprehension as the value may be of multiple values

@@ -1,63 +1,168 @@
 import polars as pl
+import numpy as np
 import warnings
 import re
 import src.util_preprocess as u
 
 
-class Processor:
+class Harmoniser:
     def __init__(self) -> None:
-        self.cols_to_keep = ['chr', 'pos', 'SNP', 'effect_allele', 'other_allele', 'eaf', 'beta', 'se', 'pval']
+        '''
+        mode = 1: Assume all alleles are coded on the forward strand, i.e. do not attempt to flip alleles
+        mode = 2: Try to infer positive strand alleles, using allele frequencies for palindromes (default, conservative); 
+        mode = 3: Correct strand for non-palindromic SNPs, and drop all palindromic SNPs from the analysis (more conservative). 
+        '''
+        # TODO: to implement the other modes
+        mode = 1
+        # error handling
+        if mode not in [1, 2, 3]:
+            raise ValueError('Mode must be either 1, 2, or 3.')
+        self.mode = mode
 
-    def format_data(self, df: pl.DataFrame) -> pl.DataFrame:
-        pass
+    def harmonise(self, exposure_df: pl.DataFrame, outcome_df: pl.DataFrame, formatted: bool = False):
 
+        # format if not formatted
+        if ~formatted:
+            # initialize formatter to format data
+            exposure_formatter = Formatter(data_type='exposure', phenotype_name='exposure', verbose=False)
+            outcome_formatter = Formatter(data_type='outcome', phenotype_name='outcome', verbose=False)
 
-class Renamer:
-    def __init__(self, column_mapping: dict) -> None:
-        self.column_mapping = column_mapping
-        # Extract the eaf column details directly from the mapping
-        self.eaf_col = column_mapping.get('eaf_col', None)
-        self.cols_to_keep = {'chr_col': 'chr', 
-                             'pos_col': 'pos', 
-                             'SNP_col': 'SNP', 
-                             'effect_allele_col': 'effect_allele', 
-                             'other_allele_col': 'other_allele', 
-                             'eaf_col': 'eaf', 
-                             'beta_col': 'beta', 
-                             'se_col': 'se', 
-                             'pval_col': 'pval'}
-
-    def rename_and_trim(self, df: pl.DataFrame) -> pl.DataFrame:
-        # Prepare the renaming map excluding the 'eaf_col' handling
-        renaming_map = {v: self.cols_to_keep[k] for k, v in self.column_mapping.items() if k != 'eaf_col'}
+            # format exposure and outcome df
+            outcome_df = outcome_df.filter(pl.col('SNP').is_in(exposure_df['SNP']))
+            exposure_df = exposure_formatter.format_data(exposure_df)           
+            outcome_df = outcome_formatter.format_data(outcome_df)
         
-        # Handle the 'eaf_col' specifically based on its type (None, str, list)
-        if isinstance(self.eaf_col, list):
-            # Calculate mean of the columns specified in the list, ignoring NA
-            eaf_mean_col = df.select([pl.mean(pl.col(col).exclude_nulls()).alias('eaf') for col in self.eaf_col]).select('eaf')
-            df = df.with_columns(eaf_mean_col)
-        elif self.eaf_col is None:
-            # Create an empty column named 'eaf'
-            df = df.with_columns(pl.lit(None).alias('eaf'))
-        else:
-            # Add the 'eaf_col' to the renaming map if it's a single column
-            renaming_map[self.eaf_col] = 'eaf'
+        # check required columns for exposure_df and outcome_df
+        exposure_columns = ['SNP'] + [x + 'exposure' for x in ["id_", "", "beta_", "se_", "effect_allele_", "other_allele_"]]
+        outcome_columns = ['SNP'] + [x + 'outcome' for x in ["id_", "", "beta_", "se_", "effect_allele_", "other_allele_"]]
+        exposure_check = [column in exposure_df.columns for column in exposure_columns]
+        outcome_check = [column in outcome_df.columns for column in outcome_columns]
 
-        # Rename the dataframe columns
-        df = df.rename(renaming_map)
-
-        # Select columns to keep, ensuring 'eaf' is included
-        columns_to_keep = list(renaming_map.values())
-        if 'eaf' not in columns_to_keep:
-            columns_to_keep.append('eaf')
-        df = df.select(columns_to_keep)
+        if not all(exposure_check):
+            raise ValueError(f'the following columns are missing for exposure_df: {np.array(exposure_columns)[~exposure_check]}')
         
-        return df
+        if not all(outcome_check):
+            raise ValueError(f'the following columns are missing for exposure_df: {np.array(outcome_columns)[~outcome_check]}')
 
+        # create result dataframe by joining
+        joined_df = exposure_df.join(outcome_df, how='inner', on='SNP')
+        joined_df = joined_df.with_columns(pl.lit(self.mode).alias('mode'))
+
+        # create a combs dataframe with unique id_exposure and id_outcome
+        # TODO: add groupby such that allow function allow multiple harmonisation using id
+        combs = joined_df.select(["id_exposure", "id_outcome"]).unique()
+        
+        harmonised_df = self._harmonise_data(joined_df, 0.8, self.mode)
+        return harmonised_df
+
+
+    def _harmonise_data(self, df: pl.DataFrame, write_drop_file=False, tolerance=0.08) -> pl.DataFrame:
+        df = df.with_columns(pl.col('SNP').alias('orig_SNP'))
+        # adding index to might be duplicated SNPs
+        df = df.with_columns(
+            pl.format("{}_{}", pl.col("SNP"), pl.int_range(1, pl.len() + 1, dtype=pl.UInt32).over("SNP"))
+            .alias("SNP")
+        )
+
+        ## for when action 2 is needed
+        # if 'eaf_exposure' in df.columns:
+        #     df = df.with_columns(pl.col('eaf_exposure').fill_nan(0.5).fill_null(0.5))
+        # else:
+        #     df = df.with_columns(pl.lit(0.5).alias('eaf_exposure'))
+
+        # if 'eaf_outcome' in df.columns:
+        #     df = df.with_columns(pl.col('eaf_outcome').fill_nan(0.5).fill_null(0.5))
+        # else:
+        #     df = df.with_columns(pl.lit(0.5).alias('eaf_outcome'))
+        
+        removed_rows = df.filter(pl.lit(False))
+
+        # handle indel
+        indel_condition = (
+            (pl.col('effect_allele_exposure').str.len_bytes() > 1) | (pl.col('effect_allele_exposure').is_in(['D', 'I'])) |
+            (pl.col('effect_allele_outcome').str.len_bytes() > 1) | (pl.col('effect_allele_outcome').is_in(['D', 'I'])) |
+            (pl.col('other_allele_exposure').str.len_bytes() > 1) | (pl.col('other_allele_exposure').is_in(['D', 'I'])) |
+            (pl.col('other_allele_outcome').str.len_bytes() > 1) | (pl.col('other_allele_outcome').is_in(['D', 'I']))
+        )
+
+        # handle the rest
+        # delete indel SNPs
+        biallelic_df = df.filter(~indel_condition)
+        biallelic_df = biallelic_df.with_columns(
+             pl.when(pl.col('effect_allele_exposure') < pl.col('other_allele_exposure'))
+             .then(pl.col('effect_allele_exposure') + pl.col('other_allele_exposure'))
+             .otherwise(pl.col('other_allele_exposure') + pl.col('effect_allele_exposure'))
+             .alias('allele_exposure'),
+
+             pl.when(pl.col('effect_allele_outcome') < pl.col('other_allele_outcome'))
+             .then(pl.col('effect_allele_outcome') + pl.col('other_allele_outcome'))
+             .otherwise(pl.col('other_allele_outcome') + pl.col('effect_allele_outcome'))
+             .alias('allele_outcome')
+        )
+
+        # handle flip for bi-allelic
+        flip_condition = (pl.col('allele_exposure') != pl.col('allele_outcome'))
+        flip_df = biallelic_df.filter(flip_condition)
+        no_flip_df = biallelic_df.filter(~flip_condition)
+        flip_df = (
+             flip_df
+             .with_columns(                
+                  pl.col('effect_allele_outcome').replace({'A':'T', 'T':'A', 'C':'G', 'G':'C'}).alias('effect_allele_outcome'),
+                  pl.col('other_allele_outcome').replace({'A':'T', 'T':'A', 'C':'G', 'G':'C'}).alias('other_allele_outcome')
+             )
+             .with_columns(
+                  pl.when(pl.col('effect_allele_outcome') < pl.col('other_allele_outcome'))
+                  .then(pl.col('effect_allele_outcome') + pl.col('other_allele_outcome'))
+                  .otherwise(pl.col('other_allele_outcome') + pl.col('effect_allele_outcome'))
+                  .alias('allele_outcome')                  
+             )
+        )
+        biallelic_df = pl.concat([no_flip_df, flip_df])
+
+        # need to drop the rows where after flip the alleles are still not the same
+        removed_rows = pl.concat([removed_rows, biallelic_df.filter(flip_condition).drop(['allele_exposure', 'allele_outcome'])])
+
+        # swaping
+        keep_condition = ((pl.col('effect_allele_exposure') == pl.col('effect_allele_outcome'))
+                          &(pl.col('other_allele_exposure') == pl.col('other_allele_outcome')))
+        to_swap_condition = ((pl.col('other_allele_exposure') == pl.col('effect_allele_outcome'))
+                               &(pl.col('effect_allele_exposure') == pl.col('other_allele_outcome')))
+        keep_df = biallelic_df.filter(keep_condition)
+        to_swap_df = biallelic_df.filter(to_swap_condition)
+
+        # need to drop rows where swaping won't match
+        removed_rows = pl.concat([removed_rows, biallelic_df.filter(~(keep_condition|to_swap_condition)).drop(['allele_exposure', 'allele_outcome'])])
+
+        # swaping effect/other allele for outcome
+        to_swap_df = (
+            to_swap_df
+            .rename(
+                {'effect_allele_outcome':'other_allele_outcome', 
+                'other_allele_outcome':'effect_allele_outcome'}
+            )
+            .with_columns(
+                (-1*pl.col('beta_outcome')).alias('beta_outcome'),
+                (1-pl.col('eaf_outcome')).alias('eaf_outcome')
+            )
+            .select(keep_df.columns) # reorder column for stacking later
+        )
+        
+        biallelic_df = pl.concat([keep_df, to_swap_df])
+        biallelic_df = biallelic_df.drop(['allele_exposure', 'allele_outcome'])
+
+        # if write drop file
+        if write_drop_file and (removed_rows.height > 0):
+            removed_rows.write_csv('removed_SNPs.csv')
+
+        return biallelic_df
+        
 
 class Formatter:
     # Format DataFrame supposing colnames has been changed
-    def __init__(self, **kwargs):
+    def __init__(self, verbose= True, **kwargs):
+        
+        # Set verbose level
+        self.verbose = verbose
         # Set default values
         self.config = {
             'data_type': 'exposure',
@@ -162,7 +267,8 @@ class Formatter:
         # get exposure name
         exposure_name = self.config['data_type'] if self.config['phenotype_name'] is None else self.config['phenotype_name']
         if self.config['phenotype_col'] is not df.columns:
-            print(f"No phenotype name specified, defaulting to '{self.config['data_type']}'.") # TODO: change to logger
+            if self.verbose:
+                print(f"No multiple phenotype name specified, defaulting to *{self.config['data_type']}*.") # TODO: change to logger
             # create literall column of exposure_name
             df = df.with_columns(pl.lit(exposure_name).alias(self.config['data_type']))
         else:
@@ -174,7 +280,7 @@ class Formatter:
 
         return df
     
-    def _remove_duplicates(self, group_df: pl.DataFrame, verbose=False) -> pl.DataFrame:
+    def _remove_duplicates(self, group_df: pl.DataFrame) -> pl.DataFrame:
         # Identify duplicate SNPs within the group
         dup_mask = group_df['SNP'].is_duplicated().alias("dup")
         # Add a duplicate mask column to the DataFrame
@@ -182,8 +288,8 @@ class Formatter:
         # Check if there are any duplicates and print a warning if so
         if group_df_with_dup.filter(pl.col("dup")).height > 0:
             duplicated_snps = group_df_with_dup.filter(pl.col("dup"))['SNP'].to_list()
-            if verbose:
-                print(f"Duplicated SNPs present in exposure data for phenotype '{group_df_with_dup[self.config['data_type']][0]}'. Just keeping the first instance:\n" + "\n".join(duplicated_snps))
+            if self.verbose:
+                print(f"Duplicated SNPs present in exposure data for phenotype '{group_df_with_dup[self.config['data_type']][0]}'. Keeping the first instance:\n" + "\n".join(duplicated_snps))
         
         # Filter out duplicates
         return group_df_with_dup.filter(~pl.col("dup")).drop("dup")
@@ -199,9 +305,9 @@ class Formatter:
         missing_required_cols = [col for col in mr_cols_required if col not in df.columns]
         if missing_required_cols:
             warnings.warn(f"The following columns are not present and are required for MR analysis:\n{', '.join(missing_required_cols)}")
-            df = df.with_columns(pl.lit(False).alias('mr_keep.outcome'))
+            df = df.with_columns(pl.lit(False).alias(f"mr_keep_{self.config['data_type']}"))
         else:
-            df = df.with_columns(pl.lit(True).alias('mr_keep.outcome')) # TODO: check here
+            df = df.with_columns(pl.lit(True).alias(f"mr_keep_{self.config['data_type']}")) # TODO: check here
 
         # Check if desired columns are present
         missing_desired_cols = [col for col in mr_cols_desired if col not in df.columns]
@@ -213,13 +319,13 @@ class Formatter:
     def _format_beta(self, df: pl.DataFrame) -> pl.DataFrame:
         # Format the beta column
         if self.config['beta_col'] in df.columns:
-            df = df.rename({self.config['beta_col']: 'beta.outcome'})
-            df = df.with_columns(pl.col('beta.outcome').cast(pl.Float64).fill_nan(pl.lit(None)))
+            df = df.rename({self.config['beta_col']: f"beta_{self.config['data_type']}"})
+            df = df.with_columns(pl.col(f"beta_{self.config['data_type']}").cast(pl.Float64).fill_nan(pl.lit(None)))
             df = df.with_columns(
-                pl.when(pl.col('beta.outcome').is_finite().not_())
+                pl.when(pl.col(f"beta_{self.config['data_type']}").is_finite().not_())
                 .then(None)
-                .otherwise(pl.col('beta.outcome'))
-                .alias('beta.outcome')
+                .otherwise(pl.col(f"beta_{self.config['data_type']}"))
+                .alias(f"beta_{self.config['data_type']}")
             )
         else:
             warnings.warn("beta column is not present.")
@@ -228,16 +334,16 @@ class Formatter:
     def _format_se(self, df: pl.DataFrame) -> pl.DataFrame:
         # Format the se column
         if self.config['se_col'] in df.columns:
-            df = df.rename({self.config['se_col']: 'se.outcome'})
-            df = df.with_columns(pl.col('se.outcome').cast(pl.Float64).fill_nan(pl.lit(None)))
+            df = df.rename({self.config['se_col']: f"se_{self.config['data_type']}"})
+            df = df.with_columns(pl.col(f"se_{self.config['data_type']}").cast(pl.Float64).fill_nan(pl.lit(None)))
             df = df.with_columns(
                 pl.when(
-                    pl.col('se.outcome').is_finite().not_() | 
-                    (pl.col('se.outcome') <= 0)
+                    pl.col(f"se_{self.config['data_type']}").is_finite().not_() | 
+                    (pl.col(f"se_{self.config['data_type']}") <= 0)
                 )
                 .then(None)
-                .otherwise(pl.col('se.outcome'))
-                .alias('se.outcome')
+                .otherwise(pl.col(f"se_{self.config['data_type']}"))
+                .alias(f"se_{self.config['data_type']}")
             )
         else:
             warnings.warn("se column is not present.")
@@ -246,17 +352,17 @@ class Formatter:
     def _format_eaf(self, df: pl.DataFrame) -> pl.DataFrame:
         # Format the eaf column
         if self.config['eaf_col'] in df.columns:
-            df = df.rename({self.config['eaf_col']: 'eaf.outcome'})
-            df = df.with_columns(pl.col('eaf.outcome').cast(pl.Float64).fill_nan(pl.lit(None)))
+            df = df.rename({self.config['eaf_col']: f"eaf_{self.config['data_type']}"})
+            df = df.with_columns(pl.col(f"eaf_{self.config['data_type']}").cast(pl.Float64).fill_nan(pl.lit(None)))
             df = df.with_columns(
                 pl.when(
-                    pl.col('eaf.outcome').is_finite().not_() | 
-                    (pl.col('eaf.outcome') <= 0) | 
-                    (pl.col('eaf.outcome') >= 1)
+                    pl.col(f"eaf_{self.config['data_type']}").is_finite().not_() | 
+                    (pl.col(f"eaf_{self.config['data_type']}") <= 0) | 
+                    (pl.col(f"eaf_{self.config['data_type']}") >= 1)
                 )
                 .then(None)
-                .otherwise(pl.col('eaf.outcome'))
-                .alias('eaf.outcome'))
+                .otherwise(pl.col(f"eaf_{self.config['data_type']}"))
+                .alias(f"eaf_{self.config['data_type']}"))
         else:
             warnings.warn("eaf column is not present.")
         return df
@@ -264,8 +370,8 @@ class Formatter:
     def _format_effect_allele(self, df: pl.DataFrame) -> pl.DataFrame:
         # Format the effect allele column
         if self.config['effect_allele_col'] in df.columns:
-            df = df.rename({self.config['effect_allele_col']: 'effect_allele.outcome'})
-            df = df.with_columns(pl.col('effect_allele.outcome').str.to_uppercase().apply(lambda value: None if (not re.match("^[ACTGDI]+$", value)) else value).alias('effect_allele.outcome')) # TODO: Check why D and I
+            df = df.rename({self.config['effect_allele_col']: f"effect_allele_{self.config['data_type']}"})
+            df = df.with_columns(pl.col(f"effect_allele_{self.config['data_type']}").str.to_uppercase().apply(lambda value: None if (not re.match("^[ACTGDI]+$", value)) else value).alias(f"effect_allele_{self.config['data_type']}")) # TODO: Check why D and I
         else:
             warnings.warn("effect_allele column is not present.")
         return df
@@ -273,8 +379,8 @@ class Formatter:
     def _format_other_allele(self, df: pl.DataFrame) -> pl.DataFrame:
         # Format the other allele column
         if self.config['other_allele_col'] in df.columns:
-            df = df.rename({self.config['other_allele_col']: 'other_allele.outcome'})
-            df = df.with_columns(pl.col('other_allele.outcome').str.to_uppercase().apply(lambda value: None if (not re.match("^[ACTGDI]+$", value)) else value).alias('other_allele.outcome')) # TODO: CHeck why D and I
+            df = df.rename({self.config['other_allele_col']: f"other_allele_{self.config['data_type']}"})
+            df = df.with_columns(pl.col(f"other_allele_{self.config['data_type']}").str.to_uppercase().apply(lambda value: None if (not re.match("^[ACTGDI]+$", value)) else value).alias(f"other_allele_{self.config['data_type']}")) # TODO: CHeck why D and I
         else:
             warnings.warn("other_allele column is not present.")
         return df
@@ -285,22 +391,22 @@ class Formatter:
         # Updates the DataFrame to include corrected or inferred p-value outcomes and their origin.
         pval_col = self.config['pval_col']
         if pval_col in df.columns:
-            df = df.with_columns(pl.col(pval_col).cast(pl.Float64).alias("pval.outcome"))
+            df = df.with_columns(pl.col(pval_col).cast(pl.Float64).alias(f"pval_{self.config['data_type']}"))
             # Coerce non-numeric pval to numeric and handle out-of-range values
             df = df.with_columns(
                 pl.when(
-                    pl.col("pval.outcome").is_finite().not_() | 
-                    (pl.col("pval.outcome") < 0) | 
-                    (pl.col("pval.outcome") > 1)
+                    pl.col(f"pval_{self.config['data_type']}").is_finite().not_() | 
+                    (pl.col(f"pval_{self.config['data_type']}") < 0) | 
+                    (pl.col(f"pval_{self.config['data_type']}") > 1)
                 )
                 .then(pl.lit(None))
-                .otherwise(pl.col("pval.outcome")).alias("pval.outcome")
+                .otherwise(pl.col(f"pval_{self.config['data_type']}")).alias(f"pval_{self.config['data_type']}")
             )
             # Replace values below min_pval with min_pval
             df = df.with_columns(
-                pl.when(pl.col("pval.outcome") < self.config['min_pval'])
+                pl.when(pl.col(f"pval_{self.config['data_type']}") < self.config['min_pval'])
                 .then(self.config['min_pval'])
-                .otherwise(pl.col("pval.outcome")).alias("pval.outcome")
+                .otherwise(pl.col(f"pval_{self.config['data_type']}")).alias(f"pval_{self.config['data_type']}")
             )
 
             # Infer p-values for missing entries if beta and se columns are present
@@ -308,23 +414,23 @@ class Formatter:
             se_col = self.config['se_col']
             if beta_col in df.columns and se_col in df.columns:
                 df = df.with_columns(
-                    pl.when(pl.col("pval.outcome").is_null())
+                    pl.when(pl.col(f"pval_{self.config['data_type']}").is_null())
                     .then(pl.expr.expr_to_polars(pl.lit(2) * pl.functions.p_norm(-abs(pl.col(beta_col)) / pl.col(se_col))))
-                    .otherwise(pl.col("pval.outcome"))
-                    .alias("pval.outcome")
+                    .otherwise(pl.col(f"pval_{self.config['data_type']}"))
+                    .alias(f"pval_{self.config['data_type']}")
                 )
                 df = df.with_columns(
-                    pl.when(pl.col("pval.outcome").is_null())
+                    pl.when(pl.col(f"pval_{self.config['data_type']}").is_null())
                     .then(pl.lit("inferred"))
                     .otherwise(pl.lit("reported"))
-                    .alias("pval_origin.outcome")
+                    .alias(f"pval_origin_{self.config['data_type']}")
                 )
         else:
             # Infer p-values from beta and se if p-value column is missing
             if beta_col in df.columns and se_col in df.columns:
                 df = df.with_columns([
-                    (pl.expr.expr_to_polars(pl.lit(2) * pl.functions.p_norm(-abs(pl.col(beta_col)) / pl.col(se_col)))).alias("pval.outcome"),
-                    pl.lit("inferred").alias("pval_origin.outcome")
+                    (pl.expr.expr_to_polars(pl.lit(2) * pl.functions.p_norm(-abs(pl.col(beta_col)) / pl.col(se_col)))).alias(f"pval_{self.config['data_type']}"),
+                    pl.lit("inferred").alias(f"pval_origin_{self.config['data_type']}")
                 ])
         return df
 
@@ -332,42 +438,42 @@ class Formatter:
         # Formats and validates the 'ncase' column, renaming it and ensuring it is numeric.
         ncase_col = self.config['ncase_col']
         if ncase_col in df.columns:
-            df = df.with_columns(pl.col(ncase_col).cast(pl.Float64).alias("ncase.outcome"))
+            df = df.with_columns(pl.col(ncase_col).cast(pl.Float64).alias(f"ncase_{self.config['data_type']}"))
         return df
 
     def _format_ncontrol(self, df: pl.DataFrame) -> pl.DataFrame:
         # Formats and validates the 'ncontrol' column, renaming it and ensuring it is numeric.
         ncontrol_col = self.config['ncontrol_col']
         if ncontrol_col in df.columns:
-            df = df.with_columns(pl.col(ncontrol_col).cast(pl.Float64).alias("ncontrol.outcome"))
+            df = df.with_columns(pl.col(ncontrol_col).cast(pl.Float64).alias(f"ncontrol_{self.config['data_type']}"))
         return df
 
     def _format_samplesize(self, df: pl.DataFrame) -> pl.DataFrame:
         # Formats the 'samplesize' column, validates it, and calculates it from 'ncase' and 'ncontrol' if necessary.
         samplesize_col = self.config['samplesize_col']
         if samplesize_col in df.columns:
-            df = df.with_columns(pl.col(samplesize_col).cast(pl.Float64).alias("samplesize.outcome"))
+            df = df.with_columns(pl.col(samplesize_col).cast(pl.Float64).alias(f"samplesize_{self.config['data_type']}"))
             # Calculate samplesize from ncase and ncontrol if samplesize is NA and both ncase and ncontrol are present
-            if "ncase.outcome" in df.columns and "ncontrol.outcome" in df.columns:
+            if f"ncase_{self.config['data_type']}" in df.columns and f"ncontrol_{self.config['data_type']}" in df.columns:
                 df = df.with_columns(
                     pl.when(
-                        pl.col("samplesize.outcome").is_null() & 
-                        (pl.col("ncase.outcome").is_not_null()) & 
-                        (pl.col("ncontrol.outcome").is_not_null())
+                        pl.col(f"samplesize_{self.config['data_type']}").is_null() & 
+                        (pl.col(f"ncase_{self.config['data_type']}").is_not_null()) & 
+                        (pl.col(f"ncontrol_{self.config['data_type']}").is_not_null())
                     )
-                    .then(pl.col("ncase.outcome") + pl.col("ncontrol.outcome"))
-                    .otherwise(pl.col("samplesize.outcome"))
-                    .alias("samplesize.outcome")
+                    .then(pl.col(f"ncase_{self.config['data_type']}") + pl.col(f"ncontrol_{self.config['data_type']}"))
+                    .otherwise(pl.col(f"samplesize_{self.config['data_type']}"))
+                    .alias(f"samplesize_{self.config['data_type']}")
                 )
-        elif "ncase.outcome" in df.columns and "ncontrol.outcome" in df.columns:
-            df = df.s((pl.col("ncase.outcome") + pl.col("ncontrol.outcome")).alias("samplesize.outcome"))
+        elif f"ncase_{self.config['data_type']}" in df.columns and f"ncontrol_{self.config['data_type']}" in df.columns:
+            df = df.s((pl.col(f"ncase_{self.config['data_type']}") + pl.col(f"ncontrol_{self.config['data_type']}")).alias(f"samplesize_{self.config['data_type']}"))
         return df
 
     def _format_other_cols(self, df: pl.DataFrame) -> pl.DataFrame:
         # Formats various other columns by renaming them and ensuring their data types are appropriate.
-        for col_name, new_suffix in [("gene_col", "gene.outcome"), ("info_col", "info.outcome"),
-                                    ("z_col", "z.outcome"), ("chr_col", "chr.outcome"),
-                                    ("pos_col", "pos.outcome")]:
+        for col_name, new_suffix in [("gene_col", f"gene_{self.config['data_type']}"), ("info_col", f"info_{self.config['data_type']}"),
+                                    ("z_col", f"z_{self.config['data_type']}"), ("chr_col", f"chr_{self.config['data_type']}"),
+                                    ("pos_col", f"pos_{self.config['data_type']}")]:
             if self.config[col_name] in df.columns:
                 df = df.rename({self.config[col_name]: new_suffix})
         return df
@@ -379,8 +485,8 @@ class Formatter:
         phenotype_col = self.config['data_type']  # Assuming 'data_type' holds the column name for phenotype
         
         if units_col in df.columns:
-            df = df.with_columns(pl.col(units_col).cast(pl.Utf8).alias("units.outcome"))
-            temp = self._check_units(df, phenotype_col, "units.outcome")
+            df = df.with_columns(pl.col(units_col).cast(pl.Utf8).alias(f"units_{self.config['data_type']}"))
+            temp = self._check_units(df, phenotype_col, f"units_{self.config['data_type']}")
             
             # If any group has more than one type of unit, append units to the phenotype column
             if any(temp['ph']):
@@ -389,7 +495,7 @@ class Formatter:
                 df = df.join(temp, on=phenotype_col, how="left")
                 df = df.with_columns(
                     pl.when(pl.col("ph"))
-                    .then(pl.col(phenotype_col) + " (" + pl.col("units.outcome") + ")")
+                    .then(pl.col(phenotype_col) + " (" + pl.col(f"units_{self.config['data_type']}") + ")")
                     .otherwise(pl.col(phenotype_col))
                     .alias(phenotype_col + "_with_units")
                 )
@@ -414,8 +520,9 @@ class Formatter:
         )
         # Warning for groups with more than one type of unit
         warnings = temp.filter(pl.col("ph")).select([id_col, "first_unit"])
-        for row in warnings.to_dicts():
-            print(f"Warning: More than one type of unit specified for {row[id_col]}")
+        if self.verbose:
+            for row in warnings.to_dicts():
+                print(f"Warning: More than one type of unit specified for {row[id_col]}")
         # Drop unnecessary columns for the final output, only return 'ph' flag
         temp = temp.select([id_col, "ph"])
         return temp
@@ -426,27 +533,29 @@ class Formatter:
         # If it does not exist, generates new IDs based on some criteria (not detailed here).
         id_col = self.config['id_col']
         if id_col in df.columns:
-            df = df.with_columns(pl.col(id_col).cast(pl.Utf8).alias("id.outcome"))
+            df = df.with_columns(pl.col(id_col).cast(pl.Utf8).alias(f"id_{self.config['data_type']}"))
         else:
-            df = df.with_columns(u.create_ids(df[self.config['data_type']]).alias("id.outcome"))
+            df = df.with_columns(u.create_ids(df[self.config['data_type']]).alias(f"id_{self.config['data_type']}"))
         return df
     
     def _keep_mr_col(self, df: pl.DataFrame) -> pl.DataFrame:
         # Handles the mr_keep logic to exclude SNPs missing required information for MR tests.
         # Also ensures that all necessary columns for MR analysis are present, adding them if they are missing.
-        mr_cols = ["SNP", "beta.outcome", "se.outcome", "effect_allele.outcome", "other_allele.outcome", "eaf.outcome"]
-        if "mr_keep.outcome" in df.columns:
+        mr_cols = ["SNP", f"beta_{self.config['data_type']}", f"se_{self.config['data_type']}", 
+                   f"effect_allele_{self.config['data_type']}", f"other_allele_{self.config['data_type']}", 
+                   f"eaf_{self.config['data_type']}"]
+        if f"mr_keep_{self.config['data_type']}" in df.columns:
             # Ensure `mr_cols_present` contains columns that are actually in `df`
             mr_cols_present = [col for col in mr_cols if col in df.columns]
 
             # Create a condition that checks if any of the columns in `mr_cols_present` are null
             condition = df.select(mr_cols_present).fold(lambda s1, s2: s1.is_not_null() & s2.is_not_null())
 
-            # Use the condition to update "mr_keep.outcome"
+            # Use the condition to update "mr_keep_outcome"
             df = df.with_columns(
                 pl.when(condition)
-                .then(df["mr_keep.outcome"])
-                .otherwise(pl.lit(False)).alias("mr_keep.outcome")
+                .then(df[f"mr_keep_{self.config['data_type']}"])
+                .otherwise(pl.lit(False)).alias(f"mr_keep_{self.config['data_type']}")
             )
 
         # Ensuring all necessary MR columns are present
